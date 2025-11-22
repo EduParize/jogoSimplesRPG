@@ -1,21 +1,25 @@
 #include "raylib.h"
-#include <stdio.h>  // Para sprintf (formatar texto)
-#include <stdbool.h> // Para bool, true, false
-#include <stdlib.h> // Para rand, srand
-#include <time.h>   // Para time (semente RNG)
+#include <stdio.h>
+#include <stdbool.h>
+#include <stdlib.h>
+#include <math.h>
+#include <time.h>
+#include <sys/stat.h>
+#include <sys/types.h>
+#include <stdint.h>
 
 //------------------------------------------------------------------------------------
-// Constantes e Definições de Tela
+// CONSTANTES
 //------------------------------------------------------------------------------------
 #define SCREEN_WIDTH 1000
 #define SCREEN_HEIGHT 700
 
 //------------------------------------------------------------------------------------
-// Estruturas de Dados do Jogo
+// ESTRUTURAS
 //------------------------------------------------------------------------------------
 
-// Estados principais do jogo
 typedef enum {
+    GAME_STATE_TITLE,
     GAME_STATE_EXPLORE,
     GAME_STATE_BATTLE,
     GAME_STATE_ENDING_GOOD,
@@ -23,37 +27,33 @@ typedef enum {
     GAME_STATE_ENDING_ESCAPE
 } GameState;
 
-// Itens que o jogador pode coletar
 typedef enum {
     ITEM_NONE,
-    ITEM_POTION,      // Cura o jogador (Uso único)
-    ITEM_SWORD,       // Causa dano médio ao chefe (Reutilizável)
-    ITEM_BOMB,        // Causa dano alto ao chefe (Uso único)
-    ITEM_COIN,        // Distrai o chefe para fugir (Uso único)
-    ITEM_ARMOR        // Reduz dano recebido (Reutilizável)
+    ITEM_POTION,
+    ITEM_SWORD,
+    ITEM_BOMB,
+    ITEM_COIN,
+    ITEM_ARMOR
 } ItemType;
 
-// Estrutura do Jogador
 typedef struct {
     int hp;
     int maxHp;
 } Player;
 
-// Estrutura do Chefe
 typedef struct {
     int hp;
     int maxHp;
     int attack;
 } Boss;
 
-// Estados da batalha
 typedef enum {
     BATTLE_PLAYER_TURN,
     BATTLE_BOSS_TURN,
 } BattleState;
 
 //------------------------------------------------------------------------------------
-// Variáveis Globais do Jogo
+// VARIÁVEIS GLOBAIS
 //------------------------------------------------------------------------------------
 static GameState currentState;
 static BattleState battleState;
@@ -75,15 +75,68 @@ static char messageBuffer[256]; // Buffer para formatar mensagens
 static bool playerHasArmor;
 static float bossTurnTimer; // Um pequeno delay para o turno do chefe
 
+// Animações de batalha
+static float playerAttackTimer;
+static const float PLAYER_ATTACK_DURATION = 0.45f;
+static bool playerIsAttacking;
+
+static float playerHurtTimer;
+static const float PLAYER_HURT_DURATION = 0.9f;
+
+// Sprites / textures
+static Texture2D playerTexture;
+static Texture2D bossTexture;
+static Texture2D titleBackgroundTexture;
+static Texture2D battleBackgroundTexture;
+
+static bool texturesInitialized = false;
+// Optional animated boss frames (for GIF support)
+static Texture2D *bossFrames = NULL;
+static int bossFrameCount = 0;
+static int bossFrameIndex = 0;
+static float bossFrameTime = 0.0f;
+static float bossFrameDuration = 0.12f; // seconds per frame
+// Attack spritesheet (optional)
+static Texture2D playerAttackTexture;
+static int playerAttackFrameCount;
+static int playerAttackFrame;
+static float playerAttackFrameTime; // time since last frame
+static float playerAttackFrameDuration; // seconds per frame
+// Custom attack / hit textures
+static Texture2D bossAttackTexture;
+static Texture2D playerHitTexture;
+static Texture2D bossHitTexture;
+// Boss attack spritesheet frames
+static int bossAttackFrameCount;
+static int bossAttackFrame;
+static float bossAttackFrameTime;
+static float bossAttackFrameDuration;
+// Boss attack / hurt state
+static bool bossIsAttacking;
+static float bossAttackTimer;
+// Reduced duration to speed up boss attack spritesheet animation
+static const float BOSS_ATTACK_DURATION = 0.40f;
+static float bossHurtTimer;
+static const float BOSS_HURT_DURATION = 0.9f;
+
 // Variáveis para a mensagem de coleta de item
 static float itemMessageTimer = 0.0f;
 static ItemType lastItemCollected = ITEM_NONE;
 
+// Exploração: posição do personagem e portas
+static float explorePlayerX;
+static float explorePlayerY;
+static Rectangle doorLeftRect;
+static Rectangle doorRightRect;
+static float explorePlayerSpeed;
+
 //------------------------------------------------------------------------------------
-// Funções Auxiliares
+// FUNÇÕES
 //------------------------------------------------------------------------------------
 
-// Retorna o nome do item para exibição
+// Forward declaration (placed early so InitGame may call it)
+static bool SaveImageAsBMP(const Image img, const char *fileName);
+
 const char* GetItemName(ItemType item) {
     switch (item) {
         case ITEM_POTION: return "Pocao (Cura 50 HP)";
@@ -95,7 +148,6 @@ const char* GetItemName(ItemType item) {
     }
 }
 
-// Define qual item o jogador recebe com base no estágio e na escolha (0 para esquerda/cima, 1 para direita/baixo)
 ItemType GetItemForChoice(int stage, int choice) {
     if (stage == 0) {
         return (choice == 0) ? ITEM_POTION : ITEM_POTION;
@@ -104,7 +156,6 @@ ItemType GetItemForChoice(int stage, int choice) {
         return (choice == 0) ? ITEM_SWORD : ITEM_BOMB;
     }
     if (stage == 2) {
-        // Nesta cena o jogador pode coletar uma moeda (choice == 1)
         return (choice == 0) ? ITEM_ARMOR : ITEM_COIN;
     }
     if (stage == 3) {
@@ -113,38 +164,41 @@ ItemType GetItemForChoice(int stage, int choice) {
     return ITEM_NONE;
 }
 
-// Ação do chefe
 void BossAttack() {
+    // start boss attack animation
+    bossIsAttacking = true;
+    bossAttackTimer = BOSS_ATTACK_DURATION;
+    // init boss attack frames
+    bossAttackFrame = 0;
+    bossAttackFrameTime = 0.0f;
+    if (bossAttackFrameCount > 0) bossAttackFrameDuration = BOSS_ATTACK_DURATION / (float)bossAttackFrameCount;
     if (playerHasArmor) {
-        // Com armadura ativa, o dano é reduzido em 50%
         int min = (boss.attack - 5) / 2;
         if (min < 1) min = 1;
         int max = (boss.attack + 5) / 2;
         int damage = min + (rand() % (max - min + 1));
         player.hp -= damage;
         if (player.hp < 0) player.hp = 0;
-        
         sprintf(messageBuffer, "Chefe ataca com armadura ativa! Voce levou %d de dano.", damage);
         battleMessage = messageBuffer;
     } else {
-        // Dano aleatorio do chefe (varia em torno do valor base)
         int min = boss.attack - 5;
         if (min < 1) min = 1;
         int max = boss.attack + 5;
         int damage = min + (rand() % (max - min + 1));
         player.hp -= damage;
         if (player.hp < 0) player.hp = 0;
-
         sprintf(messageBuffer, "Chefe ataca! Voce levou %d de dano!", damage);
         battleMessage = messageBuffer;
     }
+    // Trigger player hurt animation (blink)
+    playerHurtTimer = PLAYER_HURT_DURATION;
 }
 
-// Ação do jogador (Usar item)
 void UseItem(int index) {
     if (itemUsed[index]) {
         battleMessage = "Este item ja foi usado!";
-        return; // Não gasta o turno
+        return;
     }
 
     ItemType item = inventory[index];
@@ -154,14 +208,12 @@ void UseItem(int index) {
             player.hp += 50;
             if (player.hp > player.maxHp) player.hp = player.maxHp;
             battleMessage = "Voce usou Pocao! Curou 50 HP!";
-            itemUsed[index] = true; // <-- Marcado como usado
+            itemUsed[index] = true;
             break;
         case ITEM_SWORD:
-            // A Espada nao e um item de utilitario: ela apenas aumenta o dano do ataque.
             battleMessage = "Espada: aumenta seu dano. Use ATACAR [A].";
-            return; // nao gasta o turno nem prepara o turno do chefe
+            return;
         case ITEM_BOMB:
-            // Bomba causa dano alto e aleatorio
             {
                 int min = 60;
                 int max = 90;
@@ -170,29 +222,24 @@ void UseItem(int index) {
                 if (boss.hp < 0) boss.hp = 0;
                 sprintf(messageBuffer, "Voce usou Bomba! Causou %d de dano!", dmg);
                 battleMessage = messageBuffer;
-                itemUsed[index] = true; // <-- Marcado como usado
+                itemUsed[index] = true;
             }
             break;
         case ITEM_COIN:
-            // Usar a moeda tem 50% de chance de distrair o chefe
             itemUsed[index] = true;
             if (rand() % 2 == 0) {
-                // Sucesso: distrai o chefe e fuga
                 battleMessage = "Voce usou Moeda! Distraiu o chefe e fugiu!";
                 currentState = GAME_STATE_ENDING_ESCAPE;
-                return; // Transicao imediata para o final de fuga
+                return;
             } else {
-                // Falha: moeda nao distrai, chefe contra-ataca
                 battleMessage = "Voce usou Moeda! Mas o chefe nao se distraiu...";
-                // Prepara o turno do chefe para contra-atacar
                 battleState = BATTLE_BOSS_TURN;
                 bossTurnTimer = 1.5f;
-                return; // Gasta o turno
+                return;
             }
         case ITEM_ARMOR:
             playerHasArmor = true;
             battleMessage = "Voce equipou Armadura! Proximos ataques causarao menos dano.";
-            // NÂO marcar como usado (permanece ativo)
             break;
         default:
             battleMessage = "Item invalido?";
@@ -201,12 +248,10 @@ void UseItem(int index) {
     
     if (boss.hp < 0) boss.hp = 0;
 
-    // Prepara o turno do chefe
     battleState = BATTLE_BOSS_TURN;
-    bossTurnTimer = 1.5f; // Delay de 1.5 segundos
+    bossTurnTimer = 1.5f;
 }
 
-// Verifica se o jogador possui uma espada no inventario
 bool PlayerHasSword(void) {
     for (int i = 0; i < INVENTORY_SIZE; i++) {
         if (inventory[i] == ITEM_SWORD) return true;
@@ -214,10 +259,8 @@ bool PlayerHasSword(void) {
     return false;
 }
 
-// Ação de ataque do jogador (botao ATACAR)
 void PlayerAttack(void) {
-    // Dano aleatorio do jogador; espada aumenta o intervalo
-    int damage = 0;
+    int damage;
     if (PlayerHasSword()) {
         int min = 20;
         int max = 40;
@@ -235,89 +278,310 @@ void PlayerAttack(void) {
     }
     battleMessage = messageBuffer;
 
-    // Prepara o turno do chefe
+    // Start attack animation (player lunges forward)
+    playerIsAttacking = true;
+    playerAttackTimer = PLAYER_ATTACK_DURATION;
+    // init attack frames
+    playerAttackFrame = 0;
+    playerAttackFrameTime = 0.0f;
+
+    // trigger boss hurt animation
+    bossHurtTimer = BOSS_HURT_DURATION;
+
+    // Proceed to boss turn after a short delay
     battleState = BATTLE_BOSS_TURN;
-    bossTurnTimer = 1.5f;
+    bossTurnTimer = 1.1f; // slightly shorter so animation can play
 }
 
-// Inicializa/Reinicia as variáveis do jogo
 void InitGame(void) {
-    currentState = GAME_STATE_EXPLORE;
+    currentState = GAME_STATE_TITLE;
     currentStage = 0;
     inventoryCount = 0;
     itemMessageTimer = 0.0f;
     lastItemCollected = ITEM_NONE;
 
-    // Resetar inventário
     for (int i = 0; i < INVENTORY_SIZE; i++) {
         inventory[i] = ITEM_NONE;
         itemUsed[i] = false;
     }
 
-    // Status do Jogador
     player.hp = 120;
     player.maxHp = 120;
 
-    // Status do Chefe
     boss.hp = 200;
     boss.maxHp = 200;
-    boss.attack = 22; // Dano do chefe
+    boss.attack = 22;
 
-    // Status da Batalha
     battleState = BATTLE_PLAYER_TURN;
     selectedItemIndex = 0;
     playerHasArmor = false;
     battleMessage = "Batalha contra o Chefe! Escolha seu item.";
 
-    // Inicializar semente do RNG para danos aleatorios
     srand((unsigned int)time(NULL));
+
+    // Exploração: inicializa jogador na sala
+    explorePlayerX = SCREEN_WIDTH / 2 - 10;
+    explorePlayerY = 420; // alinhado com os elementos da UI
+    explorePlayerSpeed = 250.0f; // pixels por segundo
+    doorLeftRect = (Rectangle){ 100, 240, 150, 220 };
+    doorRightRect = (Rectangle){ SCREEN_WIDTH - 250, 240, 150, 220 };
+
+    // Inicializar/Carregar texturas de sprites (assets/player.png, assets/boss.png)
+    if (!texturesInitialized) {
+        // garante que a pasta assets existe
+        struct stat st = {0};
+        if (stat("assets", &st) == -1) {
+            // tentar criar a pasta
+            #if defined(_WIN32)
+                mkdir("assets");
+            #else
+                mkdir("assets", 0755);
+            #endif
+        }
+
+        if (FileExists("assets/player.png")) {
+            playerTexture = LoadTexture("assets/player.png");
+        } else if (FileExists("assets/player.bmp")) {
+            playerTexture = LoadTexture("assets/player.bmp");
+        } else {
+            // gerar imagem exemplo e salvar em assets/player.bmp
+            Image img = GenImageColor(64, 64, BLUE);
+            // desenha um rosto simples na imagem
+            for (int y = 10; y < 54; y++) {
+                for (int x = 10; x < 54; x++) {
+                    if ((x-32)*(x-32)+(y-24)*(y-24) < 10*10) ImageDrawPixel(&img, x, y, (Color){255,200,150,255});
+                }
+            }
+            SaveImageAsBMP(img, "assets/player.bmp");
+            playerTexture = LoadTextureFromImage(img);
+            UnloadImage(img);
+        }
+
+        if (FileExists("assets/boss.png")) {
+            bossTexture = LoadTexture("assets/boss.png");
+        } else if (FileExists("assets/boss.bmp")) {
+            bossTexture = LoadTexture("assets/boss.bmp");
+        } else {
+            Image img2 = GenImageColor(96, 96, RED);
+            // desenha olhos simples
+            for (int y = 28; y < 40; y++) {
+                for (int x = 22; x < 30; x++) ImageDrawPixel(&img2, x, y, WHITE);
+                for (int x = 66; x < 74; x++) ImageDrawPixel(&img2, x, y, WHITE);
+            }
+            SaveImageAsBMP(img2, "assets/boss.bmp");
+            bossTexture = LoadTextureFromImage(img2);
+            UnloadImage(img2);
+        }
+
+        // Try loading an animated GIF for the boss (assets/boss.gif)
+        // Note: full animated GIF decoding depends on your raylib build.
+        // As a safe fallback, load boss.gif as a regular texture (first frame).
+        bossFrameCount = 0;
+        bossFrameIndex = 0;
+        bossFrameTime = 0.0f;
+        if (FileExists("assets/boss.gif")) {
+            bossTexture = LoadTexture("assets/boss.gif");
+            // If your raylib supports LoadImageAnim, we can later adapt to extract frames.
+        }
+
+        // Load optional boss attack and hit/player hit textures
+        if (FileExists("assets/boss_attack.png")) {
+            bossAttackTexture = LoadTexture("assets/boss_attack.png");
+        } else if (FileExists("assets/boss_attack.bmp")) {
+            bossAttackTexture = LoadTexture("assets/boss_attack.bmp");
+        } else {
+            bossAttackTexture = (Texture2D){0};
+        }
+
+        // if boss attack texture is a spritesheet (horizontal strip), compute frames
+        bossAttackFrameCount = 0;
+        bossAttackFrame = 0;
+        bossAttackFrameTime = 0.0f;
+        bossAttackFrameDuration = BOSS_ATTACK_DURATION;
+        if (bossAttackTexture.id != 0) {
+            if (bossAttackTexture.height > 0) {
+                bossAttackFrameCount = bossAttackTexture.width / bossAttackTexture.height;
+                if (bossAttackFrameCount < 1) bossAttackFrameCount = 1;
+                bossAttackFrameDuration = BOSS_ATTACK_DURATION / (float)bossAttackFrameCount;
+            } else {
+                bossAttackFrameCount = 1;
+                bossAttackFrameDuration = BOSS_ATTACK_DURATION;
+            }
+        }
+
+        if (FileExists("assets/player_hit.png")) {
+            playerHitTexture = LoadTexture("assets/player_hit.png");
+        } else if (FileExists("assets/player_hit.bmp")) {
+            playerHitTexture = LoadTexture("assets/player_hit.bmp");
+        } else {
+            playerHitTexture = (Texture2D){0};
+        }
+
+        if (FileExists("assets/boss_hit.png")) {
+            bossHitTexture = LoadTexture("assets/boss_hit.png");
+        } else if (FileExists("assets/boss_hit.bmp")) {
+            bossHitTexture = LoadTexture("assets/boss_hit.bmp");
+        } else {
+            bossHitTexture = (Texture2D){0};
+        }
+
+        // Try loading optional attack spritesheet: assets/player_attack.png or .bmp
+        playerAttackFrameCount = 0;
+        playerAttackFrame = 0;
+        playerAttackFrameTime = 0.0f;
+        playerAttackFrameDuration = PLAYER_ATTACK_DURATION; // will be divided if frames exist
+        if (FileExists("assets/player_attack.png")) {
+            playerAttackTexture = LoadTexture("assets/player_attack.png");
+        } else if (FileExists("assets/player_attack.bmp")) {
+            playerAttackTexture = LoadTexture("assets/player_attack.bmp");
+        } else {
+            playerAttackTexture = (Texture2D){0};
+        }
+
+        if (playerAttackTexture.id != 0) {
+            // assume horizontal strip: frames = width / height
+            if (playerAttackTexture.height > 0) {
+                playerAttackFrameCount = playerAttackTexture.width / playerAttackTexture.height;
+                if (playerAttackFrameCount < 1) playerAttackFrameCount = 1;
+                playerAttackFrameDuration = PLAYER_ATTACK_DURATION / (float)playerAttackFrameCount;
+            } else {
+                playerAttackFrameCount = 1;
+                playerAttackFrameDuration = PLAYER_ATTACK_DURATION;
+            }
+        }
+      // Tenta carregar a textura de fundo da tela de título
+        if (FileExists("assets/title_bg.png")) {
+            titleBackgroundTexture = LoadTexture("assets/title_bg.png");
+        } else if (FileExists("assets/title_bg.bmp")) {
+            titleBackgroundTexture = LoadTexture("assets/title_bg.bmp");
+        } else if (FileExists("assets/title_bg.jpg")) { // <-- NOVO CÓDIGO AQUI
+            titleBackgroundTexture = LoadTexture("assets/title_bg.jpg");
+        } else {
+            // Se o arquivo de fundo não existir, a textura será 0, e usaremos cor sólida.
+            titleBackgroundTexture = (Texture2D){0};
+        }
+        if (FileExists("assets/battle_bg.png")) {
+            battleBackgroundTexture = LoadTexture("assets/battle_bg.png");
+        } else if (FileExists("assets/battle_bg.bmp")) {
+            battleBackgroundTexture = LoadTexture("assets/battle_bg.bmp");
+        } else if (FileExists("assets/battle_bg.jpg")) { // <-- Adiciona suporte a JPG
+            battleBackgroundTexture = LoadTexture("assets/battle_bg.jpg");
+        } else {
+            // Se o arquivo de fundo não existir, a textura será 0
+            battleBackgroundTexture = (Texture2D){0};
+        }
+        texturesInitialized = true;
+        // initialize boss/player attack/hurt states
+        bossIsAttacking = false;
+        bossAttackTimer = 0.0f;
+        bossHurtTimer = 0.0f;
+    }
 }
 
 //------------------------------------------------------------------------------------
-// Funções de Update (Lógica)
+// UPDATE
 //------------------------------------------------------------------------------------
 
-// Lógica da Exploração
 void UpdateExplore(void) {
-    // Se o timer da mensagem de item estiver ativo, apenas o diminua.
     if (itemMessageTimer > 0) {
         itemMessageTimer -= GetFrameTime();
-        
-        // Se o timer acabou E chegamos ao fim da exploração, vá para a batalha
         if (itemMessageTimer <= 0 && currentStage >= 4) {
             currentState = GAME_STATE_BATTLE;
             battleState = BATTLE_PLAYER_TURN;
         }
-        return; // Não processe input enquanto a mensagem estiver na tela
+        return;
     }
 
-    // Timer zerado, processar input
-    int choice = -1; // -1 = sem escolha, 0 = escolha 1, 1 = escolha 2
+    int choice = -1;
 
-    if (IsKeyPressed(KEY_ONE)) {
-        choice = 0;
+    // Movimento do personagem pela sala
+    float delta = GetFrameTime();
+    if (IsKeyDown(KEY_RIGHT) || IsKeyDown(KEY_D)) {
+        explorePlayerX += explorePlayerSpeed * delta;
     }
-    if (IsKeyPressed(KEY_TWO)) {
-        choice = 1;
+    if (IsKeyDown(KEY_LEFT) || IsKeyDown(KEY_A)) {
+        explorePlayerX -= explorePlayerSpeed * delta;
     }
 
-    if (choice != -1) {
-        // Adiciona o item ao inventário
-        lastItemCollected = GetItemForChoice(currentStage, choice); // Salva o item
-        inventory[inventoryCount] = lastItemCollected;
-        inventoryCount++;
-        
-        // Avança para o próximo estágio
-        currentStage++;
-        
-        // Ativa o timer da mensagem
-        itemMessageTimer = 2.0f; // 2 segundos
+    // Mantem dentro da sala (limites simples)
+    if (explorePlayerX < 60) explorePlayerX = 60;
+    if (explorePlayerX > SCREEN_WIDTH - 80) explorePlayerX = SCREEN_WIDTH - 80;
+
+    // Ao pressionar ENTER, verificar se o jogador esta proximo a uma porta
+    if (IsKeyPressed(KEY_ENTER)) {
+        // verifica colisao simples com a area da porta
+        Rectangle playerRect = (Rectangle){ explorePlayerX - 5, explorePlayerY - 10, 30, 60 };
+        int chosen = -1;
+        if (CheckCollisionRecs(playerRect, doorLeftRect)) chosen = 0;
+        if (CheckCollisionRecs(playerRect, doorRightRect)) chosen = 1;
+
+        if (chosen != -1) {
+            lastItemCollected = GetItemForChoice(currentStage, chosen);
+            if (inventoryCount < INVENTORY_SIZE) {
+                inventory[inventoryCount] = lastItemCollected;
+                inventoryCount++;
+            }
+            currentStage++;
+            itemMessageTimer = 2.0f;
+            explorePlayerX = SCREEN_WIDTH / 2 - 10;
+        }
     }
 }
 
-// Lógica da Batalha
 void UpdateBattle(void) {
-    // Checagem de vitória/derrota (acontece antes de qualquer turno)
+    float delta = GetFrameTime();
+
+    // Animations timers
+    if (playerIsAttacking) {
+        playerAttackTimer -= delta;
+        if (playerAttackTimer <= 0.0f) {
+            playerIsAttacking = false;
+            playerAttackTimer = 0.0f;
+        }
+        // Advance attack spritesheet frames if available
+        if (playerAttackFrameCount > 1) {
+            playerAttackFrameTime += delta;
+            if (playerAttackFrameTime >= playerAttackFrameDuration) {
+                playerAttackFrameTime -= playerAttackFrameDuration;
+                playerAttackFrame++;
+                if (playerAttackFrame >= playerAttackFrameCount) playerAttackFrame = playerAttackFrameCount - 1;
+            }
+        }
+    }
+    if (bossIsAttacking) {
+        bossAttackTimer -= delta;
+        if (bossAttackTimer <= 0.0f) {
+            bossIsAttacking = false;
+            bossAttackTimer = 0.0f;
+        }
+        // advance boss attack spritesheet frames
+        if (bossAttackFrameCount > 1) {
+            bossAttackFrameTime += delta;
+            if (bossAttackFrameTime >= bossAttackFrameDuration) {
+                bossAttackFrameTime -= bossAttackFrameDuration;
+                bossAttackFrame++;
+                if (bossAttackFrame >= bossAttackFrameCount) bossAttackFrame = bossAttackFrameCount - 1;
+            }
+        }
+    }
+    if (bossHurtTimer > 0.0f) {
+        bossHurtTimer -= delta;
+        if (bossHurtTimer < 0.0f) bossHurtTimer = 0.0f;
+    }
+    if (playerHurtTimer > 0.0f) {
+        playerHurtTimer -= delta;
+        if (playerHurtTimer < 0.0f) playerHurtTimer = 0.0f;
+    }
+
+    // Advance boss GIF frames if loaded
+    if (bossFrameCount > 0) {
+        bossFrameTime += delta;
+        if (bossFrameTime >= bossFrameDuration) {
+            bossFrameTime -= bossFrameDuration;
+            bossFrameIndex = (bossFrameIndex + 1) % bossFrameCount;
+        }
+    }
+
     if (boss.hp <= 0) {
         currentState = GAME_STATE_ENDING_GOOD;
         return;
@@ -327,7 +591,6 @@ void UpdateBattle(void) {
         return;
     }
 
-    // Turno do Jogador
     if (battleState == BATTLE_PLAYER_TURN) {
         if (IsKeyPressed(KEY_RIGHT)) {
             selectedItemIndex = (selectedItemIndex + 1) % INVENTORY_SIZE;
@@ -336,91 +599,135 @@ void UpdateBattle(void) {
             selectedItemIndex = (selectedItemIndex - 1 + INVENTORY_SIZE) % INVENTORY_SIZE;
         }
 
-        // Ataque direto (botao ATACAR)
         if (IsKeyPressed(KEY_A)) {
             PlayerAttack();
         }
-
         if (IsKeyPressed(KEY_ENTER)) {
             UseItem(selectedItemIndex);
         }
-    }
-    // Turno do Chefe (com delay)
-    else if (battleState == BATTLE_BOSS_TURN) {
+    } else if (battleState == BATTLE_BOSS_TURN) {
         bossTurnTimer -= GetFrameTime();
         if (bossTurnTimer <= 0) {
             BossAttack();
-            battleState = BATTLE_PLAYER_TURN; // Devolve o turno ao jogador
+            battleState = BATTLE_PLAYER_TURN;
         }
     }
 }
 
-// Lógica da Tela Final
 void UpdateEnding(void) {
-    // Reinicia o jogo
     if (IsKeyPressed(KEY_ENTER)) {
         InitGame();
     }
 }
 
+void UpdateTitleScreen(void) {
+    if (IsKeyPressed(KEY_ENTER)) {
+        currentState = GAME_STATE_EXPLORE;
+    }
+}
+
 //------------------------------------------------------------------------------------
-// Funções de Draw (Gráficos)
+// DRAW
 //------------------------------------------------------------------------------------
 
-// NOVOS: Funções para desenhar os "sprites"
+// Forward declaration for BMP saver
+static bool SaveImageAsBMP(const Image img, const char *fileName);
+
+// Simple BMP saver for Raylib Image (assumes image format UNCOMPRESSED_R8G8B8A8)
+static bool SaveImageAsBMP(const Image img, const char *fileName) {
+    if (!img.data) return false;
+    FILE *f = fopen(fileName, "wb");
+    if (!f) return false;
+
+    int width = img.width;
+    int height = img.height;
+    int rowSize = (width * 3 + 3) & (~3); // padded to 4 bytes
+    int dataSize = rowSize * height;
+
+    uint32_t fileSize = 14 + 40 + dataSize;
+
+    unsigned char fileHeader[14] = {0};
+    unsigned char infoHeader[40] = {0};
+
+    // BITMAPFILEHEADER
+    fileHeader[0] = 'B'; fileHeader[1] = 'M';
+    fileHeader[2] = (unsigned char)(fileSize & 0xFF);
+    fileHeader[3] = (unsigned char)((fileSize >> 8) & 0xFF);
+    fileHeader[4] = (unsigned char)((fileSize >> 16) & 0xFF);
+    fileHeader[5] = (unsigned char)((fileSize >> 24) & 0xFF);
+    fileHeader[10] = 14 + 40; // pixel data offset
+
+    // BITMAPINFOHEADER
+    infoHeader[0] = 40;
+    infoHeader[4] = (unsigned char)(width & 0xFF);
+    infoHeader[5] = (unsigned char)((width >> 8) & 0xFF);
+    infoHeader[6] = (unsigned char)((width >> 16) & 0xFF);
+    infoHeader[7] = (unsigned char)((width >> 24) & 0xFF);
+    infoHeader[8] = (unsigned char)(height & 0xFF);
+    infoHeader[9] = (unsigned char)((height >> 8) & 0xFF);
+    infoHeader[10] = (unsigned char)((height >> 16) & 0xFF);
+    infoHeader[11] = (unsigned char)((height >> 24) & 0xFF);
+    infoHeader[12] = 1; // planes
+    infoHeader[14] = 24; // bits per pixel
+
+    fwrite(fileHeader, 1, 14, f);
+    fwrite(infoHeader, 1, 40, f);
+
+    unsigned char *pixels = (unsigned char *)img.data; // RGBA8
+
+    // BMP stores pixels bottom-to-top
+    for (int y = height - 1; y >= 0; y--) {
+        for (int x = 0; x < width; x++) {
+            unsigned char r = pixels[(y*width + x)*4 + 0];
+            unsigned char g = pixels[(y*width + x)*4 + 1];
+            unsigned char b = pixels[(y*width + x)*4 + 2];
+            unsigned char bggr[3] = { b, g, r };
+            fwrite(bggr, 1, 3, f);
+        }
+        // padding
+        for (int p = 0; p < (rowSize - width*3); p++) fputc(0, f);
+    }
+
+    fclose(f);
+    return true;
+}
+
 void DrawPlayerSprite(int posX, int posY) {
-    // Cabeça
     DrawCircle(posX + 10, posY - 10, 10, (Color){255, 200, 150, 255});
     DrawCircleLines(posX + 10, posY - 10, 10, BLACK);
-    // Olhos
     DrawCircle(posX + 6, posY - 12, 2, BLACK);
     DrawCircle(posX + 14, posY - 12, 2, BLACK);
-    // Torso
     DrawRectangle(posX, posY, 20, 40, (Color){0, 150, 255, 255});
     DrawRectangleLines(posX, posY, 20, 40, (Color){0, 100, 200, 255});
-    // Braços
     DrawRectangle(posX - 5, posY + 5, 5, 20, (Color){255, 200, 150, 255});
     DrawRectangle(posX + 20, posY + 5, 5, 20, (Color){255, 200, 150, 255});
-    // Pernas
     DrawRectangle(posX + 2, posY + 40, 6, 20, (Color){50, 50, 50, 255});
     DrawRectangle(posX + 12, posY + 40, 6, 20, (Color){50, 50, 50, 255});
 }
 
 void DrawBossSprite(int posX, int posY) {
-    // Aura/Sombra
     DrawCircle(posX + 20, posY + 30, 50, (Color){100, 0, 0, 100});
-    // Cabeça
     DrawCircle(posX + 20, posY - 15, 15, (Color){80, 20, 20, 255});
     DrawCircleLines(posX + 20, posY - 15, 15, (Color){200, 50, 50, 255});
-    // Olhos malévolos
     DrawCircle(posX + 14, posY - 18, 3, (Color){255, 100, 0, 255});
     DrawCircle(posX + 26, posY - 18, 3, (Color){255, 100, 0, 255});
-    // Torso (maior)
     DrawRectangle(posX, posY, 40, 60, (Color){200, 0, 0, 255});
     DrawRectangleLines(posX, posY, 40, 60, (Color){100, 0, 0, 255});
-    // Braços
     DrawRectangle(posX - 10, posY + 10, 10, 30, (Color){150, 0, 0, 255});
     DrawRectangle(posX + 40, posY + 10, 10, 30, (Color){150, 0, 0, 255});
-    // Pernas
     DrawRectangle(posX + 5, posY + 60, 10, 30, (Color){100, 0, 0, 255});
     DrawRectangle(posX + 25, posY + 60, 10, 30, (Color){100, 0, 0, 255});
 }
 
 
-// Desenha a UI de Exploração
 void DrawExplore(void) {
     ClearBackground((Color){20, 20, 40, 255});
 
-    // --- NOVO: Checar se a mensagem de item deve aparecer ---
     if (itemMessageTimer > 0) {
-        // Fundo com efeito
         DrawRectangle(0, 0, SCREEN_WIDTH, SCREEN_HEIGHT, (Color){0, 0, 0, 200});
-        
-        // Caixa de coleta
         DrawRectangle(SCREEN_WIDTH / 2 - 300, SCREEN_HEIGHT / 2 - 100, 600, 200, (Color){50, 50, 100, 255});
         DrawRectangleLines(SCREEN_WIDTH / 2 - 300, SCREEN_HEIGHT / 2 - 100, 600, 200, (Color){100, 200, 255, 255});
         
-        // Mensagem de coleta
         sprintf(messageBuffer, "Voce coletou: %s!", GetItemName(lastItemCollected));
         int textWidth = MeasureText(messageBuffer, 30);
         DrawText(messageBuffer, SCREEN_WIDTH / 2 - textWidth / 2, SCREEN_HEIGHT / 2 - 50, 30, (Color){100, 255, 150, 255});
@@ -428,87 +735,339 @@ void DrawExplore(void) {
         const char* msg2 = "Carregando proximo cenario...";
         int textWidth2 = MeasureText(msg2, 18);
         DrawText(msg2, SCREEN_WIDTH / 2 - textWidth2 / 2, SCREEN_HEIGHT / 2 + 40, 18, (Color){150, 150, 200, 255});
-        
-        return; // Pula o desenho normal da exploração
+        return;
     }
-    
-    // Textos variam por estágio
     const char* storyText = "";
-    const char* choice1Text = "";
-    const char* choice2Text = "";
+    switch (currentStage) {
+        case 0: storyText = "Voce chega na entrada da masmorra. O caminho esta fechado,\nvoce segue pela: Caverna umida ou Ponte antiga"; break;
+        case 1: storyText = "Voce entra em um salao com dois pedestais, voce toca o:\npedestal das chamas ou porta das sombras."; break;
+        case 2: storyText = "Um guarda protege o caminho. Ir pelo tunel escuro\n ou usar o sino quebrado para distrai-lo."; break;
+        case 3: storyText = "Voce esta cada vez mais perto: escolha um lado e avance. Lado bronze\n ou lado prata"; break;
+    }
 
+    // Desenhar a sala
+    DrawRectangle(60, 120, SCREEN_WIDTH - 120, 420, (Color){30, 40, 70, 255});
+    DrawRectangleLines(60, 120, SCREEN_WIDTH - 120, 420, (Color){100, 150, 200, 255});
+    DrawText(storyText, 80, 140, 22, (Color){200, 220, 255, 255});
+
+    // --- NOVO CÓDIGO: Desenhar o Chefe (Apenas para contexto visual, opcional) ---
+    // Apenas um pequeno ajuste de posição se quiser manter o Chefe, ignore se não for necessário.
+    /*
+    Vector2 posB = { (float)(SCREEN_WIDTH/2), 220 };
+    float scaleB = 0.75f;
+    if (texturesInitialized && bossTexture.id != 0) {
+        Rectangle srcB = {0,0,(float)bossTexture.width,(float)bossTexture.height};
+        Vector2 originB = { bossTexture.width/2.0f, bossTexture.height/2.0f };
+        Rectangle destB = { posB.x, posB.y, bossTexture.width*scaleB, bossTexture.height*scaleB };
+        DrawTexturePro(bossTexture, srcB, destB, originB, 0.0f, WHITE);
+    } else {
+        DrawBossSprite((int)posB.x - 20, (int)posB.y - 60);
+    }
+    */
+    // -----------------------------------------------------------------------------
+
+    // Desenhar portas esquerda e direita com rótulos por estágio
+    const char* leftDoorLabel = "Porta A";
+    const char* rightDoorLabel = "Porta B";
     switch (currentStage) {
         case 0:
-            storyText = "Voce esta na entrada da masmorra. O caminho se bifurca.";
-            choice1Text = "1. Seguir pela caverna umida.";
-            choice2Text = "2. Atravessar a ponte velha.";
+            leftDoorLabel = "Caverna umida";
+            rightDoorLabel = "Ponte antiga";
             break;
         case 1:
-            storyText = "Mais a fundo, voce encontra um salao com dois pedestais.";
-            choice1Text = "1. Tocar no pedestal da chama.";
-            choice2Text = "2. Tocar no pedestal da sombra.";
+            leftDoorLabel = "Pedestal da Chama";
+            rightDoorLabel = "Pedestal da Sombra";
             break;
         case 2:
-            storyText = "Um guarda fantasma bloqueia o caminho. Voce precisa distrai-lo.";
-            choice1Text = "1. Jogar uma pedra no corredor leste.";
-            choice2Text = "2. Usar o sino quebrado no corredor oeste.";
+            leftDoorLabel = "Tunel Escuro";
+            rightDoorLabel = "Sino Quebrado";
             break;
         case 3:
-            storyText = "A porta do chefe esta a sua frente. Duas alavancas a guardam.";
-            choice1Text = "1. Puxar a alavanca de Prata.";
-            choice2Text = "2. Puxar a alavanca de Bronze.";
+            leftDoorLabel = "Lado Bronze";
+            rightDoorLabel = "Lado Prata";
             break;
     }
 
-    DrawText(storyText, 40, 150, 22, (Color){200, 220, 255, 255});
-    
-    // Caixas de escolha
-    DrawRectangle(40, 230, 450, 80, (Color){50, 80, 150, 200});
-    DrawRectangleLines(40, 230, 450, 80, (Color){100, 150, 255, 255});
-    DrawText(choice1Text, 60, 255, 18, (Color){200, 255, 100, 255});
-    
-    DrawRectangle(40, 320, 450, 80, (Color){50, 80, 150, 200});
-    DrawRectangleLines(40, 320, 450, 80, (Color){100, 150, 255, 255});
-    DrawText(choice2Text, 60, 345, 18, (Color){200, 255, 100, 255});
-    
-    DrawText("Pressione [1] ou [2] para escolher...", 40, 550, 16, (Color){150, 200, 255, 255});
+    DrawRectangleRec(doorLeftRect, (Color){80, 40, 30, 255});
+    DrawRectangleLines((int)doorLeftRect.x, (int)doorLeftRect.y, (int)doorLeftRect.width, (int)doorLeftRect.height, (Color){200, 180, 150, 255});
+    DrawText(leftDoorLabel, (int)doorLeftRect.x + 10, (int)doorLeftRect.y + 90, 16, (Color){255, 220, 180, 255});
+
+    DrawRectangleRec(doorRightRect, (Color){40, 60, 90, 255});
+    DrawRectangleLines((int)doorRightRect.x, (int)doorRightRect.y, (int)doorRightRect.width, (int)doorRightRect.height, (Color){180, 200, 255, 255});
+    DrawText(rightDoorLabel, (int)doorRightRect.x + 10, (int)doorRightRect.y + 90, 16, (Color){220, 240, 255, 255});
+
+    // --- CÓDIGO ATUALIZADO PARA DESENHAR O PERSONAGEM EXPLORANDO ---
+    // Agora verifica se a textura está disponível e a usa, caso contrário, usa o sprite primitivo.
+    if (texturesInitialized && playerTexture.id != 0) {
+        float scale = 1.0f;
+        float texW = (float)playerTexture.width;
+        float texH = (float)playerTexture.height;
+        // Ajusta a posição para que o centro da textura fique no ponto de referência X,
+        // e o pé da textura fique próximo ao Y original do sprite primitivo.
+        float drawX = explorePlayerX + 10.0f; // centro X (10 é metade do largura do DrawPlayerSprite)
+        float drawY = explorePlayerY + texH/2.0f; // centro Y (metade da altura da textura)
+        
+        Rectangle src = {0, 0, texW, texH};
+        Vector2 origin = { texW/2.0f, texH/2.0f };
+        Rectangle dest = { drawX, drawY, texW * scale, texH * scale };
+        DrawTexturePro(playerTexture, src, dest, origin, 0.0f, WHITE);
+    } else {
+        // Fallback: Desenhar o sprite primitivo se a textura falhar
+        DrawPlayerSprite((int)explorePlayerX, (int)explorePlayerY);
+    }
+    // --------------------------------------------------------------
+
+    // Indicar se esta proximo a uma porta
+    Rectangle playerRect = (Rectangle){ explorePlayerX - 5, explorePlayerY - 10, 30, 60 };
+    if (CheckCollisionRecs(playerRect, doorLeftRect)) {
+        DrawTextEx(GetFontDefault(), TextFormat("[ENTER] Entrar em %s", leftDoorLabel), (Vector2){80, SCREEN_HEIGHT - 120}, 18, 1, (Color){200, 255, 200, 255});
+    } else if (CheckCollisionRecs(playerRect, doorRightRect)) {
+        DrawTextEx(GetFontDefault(), TextFormat("[ENTER] Entrar em %s", rightDoorLabel), (Vector2){80, SCREEN_HEIGHT - 120}, 18, 1, (Color){200, 255, 200, 255});
+    } else {
+        DrawText("Use SETAS ou A/D para mover. Aproximo-se da porta e pressione [ENTER].", 80, SCREEN_HEIGHT - 120, 16, (Color){180, 200, 255, 255});
+    }
 }
 
-// Desenha a UI de Batalha
-void DrawBattle(void) {
-    // Buffers locais para guardar o texto formatado do HP
+    void DrawBattle(void) {
     char bossHpText[64];
     char playerHpText[64];
     
-    ClearBackground((Color){30, 30, 50, 255});
+    // --- Desenhar o Fundo da Batalha ---
+    if (battleBackgroundTexture.id != 0) {
+        DrawTexturePro(
+            battleBackgroundTexture,
+            (Rectangle){ 0, 0, (float)battleBackgroundTexture.width, (float)battleBackgroundTexture.height },
+            (Rectangle){ 0, 0, SCREEN_WIDTH, SCREEN_HEIGHT },
+            (Vector2){ 0, 0 },
+            0.0f,
+            WHITE
+        );
+    } else {
+        ClearBackground((Color){30, 30, 50, 255}); // Fundo escuro padrão
+    }
 
-    // --- Desenhar Chefe ---
-    DrawBossSprite(SCREEN_WIDTH / 2 - 20, 50);
+    // --- VARIÁVEIS DE UI ---
+    const int BAR_MARGIN = 20;
+    const int BAR_W = 300;
+    const int BAR_H = 25;
+    const int NAME_SIZE = 22;
+    const char* playerName = "ENDRICK";      // NOME DO JOGADOR
+    const char* bossName = "CTS"; // NOME DO BOSS
     
-    // HP do Chefe com borda
-    DrawRectangle(SCREEN_WIDTH / 2 - 150, 140, 300, 25, (Color){50, 50, 80, 255});
-    DrawRectangleLines(SCREEN_WIDTH / 2 - 150, 140, 300, 25, (Color){100, 100, 150, 255});
-    DrawRectangle(SCREEN_WIDTH / 2 - 150, 140, (int)(300.0f * ((float)boss.hp / boss.maxHp)), 25, (Color){255, 50, 50, 255});
-    sprintf(bossHpText, "HP: %d / %d", boss.hp, boss.maxHp);
-    DrawText(bossHpText, SCREEN_WIDTH / 2 - 65, 142, 20, WHITE);
 
-    // --- Desenhar Jogador ---
-    DrawPlayerSprite(SCREEN_WIDTH / 2 - 10, 260);
+    // =================================================================
+    // --- HP DO JOGADOR (CANTO SUPERIOR ESQUERDO) ---
+    // =================================================================
     
-    // HP do Jogador com borda
-    DrawRectangle(SCREEN_WIDTH / 2 - 150, 350, 300, 25, (Color){50, 50, 80, 255});
-    DrawRectangleLines(SCREEN_WIDTH / 2 - 150, 350, 300, 25, (Color){100, 100, 150, 255});
-    DrawRectangle(SCREEN_WIDTH / 2 - 150, 350, (int)(300.0f * ((float)player.hp / player.maxHp)), 25, (Color){50, 200, 100, 255});
+    // Desenhar Nome do Jogador
+    DrawText(playerName, BAR_MARGIN, BAR_MARGIN, NAME_SIZE, (Color){150, 200, 255, 255});
+
+    // Desenhar Barra de HP do Jogador
+    int playerBarY = BAR_MARGIN + NAME_SIZE + 10;
+    DrawRectangle(BAR_MARGIN, (int)playerBarY, BAR_W, BAR_H, (Color){50, 50, 80, 255}); 
+    DrawRectangleLines(BAR_MARGIN, (int)playerBarY, BAR_W, BAR_H, (Color){100, 100, 150, 255});
+    DrawRectangle(BAR_MARGIN, (int)playerBarY, (int)(BAR_W * ((float)player.hp / player.maxHp)), BAR_H, (Color){50, 200, 100, 255});
     sprintf(playerHpText, "HP: %d / %d", player.hp, player.maxHp);
-    DrawText(playerHpText, SCREEN_WIDTH / 2 - 65, 352, 20, WHITE);
+    DrawText(playerHpText, BAR_MARGIN + 80, (int)playerBarY + 2, 20, WHITE);
 
-    // --- Mensagem de Batalha ---
-    DrawRectangle(0, SCREEN_HEIGHT - 180, SCREEN_WIDTH, 70, (Color){20, 20, 40, 255});
-    DrawRectangleLines(0, SCREEN_HEIGHT - 180, SCREEN_WIDTH, 70, (Color){100, 150, 200, 255});
-    DrawText(battleMessage, 25, SCREEN_HEIGHT - 160, 16, (Color){150, 255, 200, 255});
 
-    // --- Inventário / Opções ---
-    DrawText("INVENTARIO (Use SETAS e ENTER):", 20, SCREEN_HEIGHT - 100, 16, (Color){100, 200, 255, 255});
+    // =================================================================
+    // --- HP DO CHEFE (CANTO SUPERIOR DIREITO) ---
+    // =================================================================
+    
+    // Posições para o lado direito
+    int bossBarX = SCREEN_WIDTH - BAR_W - BAR_MARGIN;
+    
+    // Desenhar Nome do Boss (Alinhado à esquerda do X da barra, para ficar visível)
+    DrawText(bossName, bossBarX, BAR_MARGIN, NAME_SIZE, (Color){255, 100, 100, 255}); 
+
+    // Desenhar Barra de HP do Chefe
+    int bossBarY = BAR_MARGIN + NAME_SIZE + 10;
+    DrawRectangle(bossBarX, (int)bossBarY, BAR_W, BAR_H, (Color){50, 50, 80, 255}); 
+    DrawRectangleLines(bossBarX, (int)bossBarY, BAR_W, BAR_H, (Color){100, 100, 150, 255});
+    DrawRectangle(bossBarX, (int)bossBarY, (int)(BAR_W * ((float)boss.hp / boss.maxHp)), BAR_H, (Color){255, 50, 50, 255});
+    sprintf(bossHpText, "HP: %d / %d", boss.hp, boss.maxHp);
+    DrawText(bossHpText, bossBarX + 80, (int)bossBarY + 2, 20, WHITE);
+
+    // --- DEFINIR POSIÇÃO BASE (GROUND_Y) (Restante da função de batalha permanece o mesmo) ---
+    const float GROUND_Y = 480.0f; 
+    // ... (restante do código DrawBattle, que continua inalterado) ...
+    // Note: O restante da função (desenho dos sprites, animações, inventário)
+    // permanece como no passo anterior, apenas as barras de HP mudaram.
+    
+    // --- O restante da função DrawBattle deve ser copiado do código que você tinha! ---
+    // Certifique-se de copiar a lógica de desenho dos sprites e inventário daqui:
+    // https://storage.googleapis.com/gemini-content-files/agent-code-review/rpg.c
+
+
+    // --- Desenhar Chefe (DIREITA) ---
+    float scaleB = 1.0f;
+    float bossDrawHeight = 0.0f;
+    
+    // Obter altura da textura do Boss
+    float bossTexH = (texturesInitialized && bossTexture.id != 0) ? (float)bossTexture.height : 96.0f;
+    if (texturesInitialized && bossAttackTexture.id != 0 && bossAttackFrameCount > 0) {
+        bossTexH = (float)bossAttackTexture.height;
+    }
+    
+    // Posição base do Chefe: centro Y é a linha do chão menos metade da altura
+    Vector2 posB = { SCREEN_WIDTH - 250.0f, GROUND_Y - (bossTexH * scaleB) / 2.0f }; 
+    float bossBaseHeight = bossTexH * scaleB;
+
+    // Boss attack movement: lunge toward player area (DIREITA PARA ESQUERDA)
+    float bossAttackOffsetX = 0.0f;
+    float bossAttackOffsetY = 0.0f; // Mantém o sprite no chão
+    if (bossIsAttacking) {
+        float prog = 1.0f - (bossAttackTimer / BOSS_ATTACK_DURATION);
+        if (prog < 0.0f) prog = 0.0f;
+        if (prog > 1.0f) prog = 1.0f;
+        float ease = sinf(prog * 3.14159f);
+        
+        // Ponto de encontro: 550 (ligeramente à direita do centro)
+        const float LUNGE_DISTANCE = posB.x - 550.0f; 
+        
+        bossAttackOffsetX = -LUNGE_DISTANCE * ease; // Avança para a esquerda (NEGATIVO)
+    }
+    Vector2 drawPosB = { posB.x + bossAttackOffsetX, posB.y + bossAttackOffsetY };
+
+    if (texturesInitialized) {
+        // boss tint (blink when hurt)
+        float bossAlphaF = 1.0f;
+        if (bossHurtTimer > 0.0f) {
+            bossAlphaF = (sinf(bossHurtTimer * 30.0f) > 0.0f) ? 1.0f : 0.25f;
+        }
+        Color bossTint = (Color){255,255,255,(unsigned char)(255.0f * bossAlphaF)};
+
+        // Draw boss sprite logic (same as before, but using drawPosB)
+        if (bossIsAttacking && bossAttackTexture.id != 0) {
+            if (bossAttackFrameCount > 1) {
+                int frameW = (bossAttackFrameCount > 0) ? (bossAttackTexture.width / bossAttackFrameCount) : bossAttackTexture.width;
+                int frameH = bossAttackTexture.height;
+                Rectangle srcAtk = { (float)(bossAttackFrame * frameW), 0, (float)frameW, (float)frameH };
+                Vector2 originAtk = { frameW/2.0f, frameH/2.0f };
+                Rectangle destAtk = { drawPosB.x, drawPosB.y, frameW * scaleB, frameH * scaleB };
+                DrawTexturePro(bossAttackTexture, srcAtk, destAtk, originAtk, 0.0f, bossTint);
+                bossDrawHeight = frameH * scaleB;
+            } else {
+                Rectangle srcAtk = {0,0,(float)bossAttackTexture.width,(float)bossAttackTexture.height};
+                Vector2 originAtk = { bossAttackTexture.width/2.0f, bossAttackTexture.height/2.0f };
+                Rectangle destAtk = { drawPosB.x, drawPosB.y, bossAttackTexture.width*scaleB, bossAttackTexture.height*scaleB };
+                DrawTexturePro(bossAttackTexture, srcAtk, destAtk, originAtk, 0.0f, bossTint);
+                bossDrawHeight = bossAttackTexture.height * scaleB;
+            }
+        } else {
+            if (bossFrameCount > 0 && bossFrames != NULL) {
+                Texture2D tex = bossFrames[bossFrameIndex];
+                Rectangle srcB = {0,0,(float)tex.width,(float)tex.height};
+                Vector2 originB = { tex.width/2.0f, tex.height/2.0f };
+                Rectangle destB = { drawPosB.x, drawPosB.y, tex.width*scaleB, tex.height*scaleB };
+                DrawTexturePro(tex, srcB, destB, originB, 0.0f, bossTint);
+                bossDrawHeight = tex.height * scaleB;
+            } else if (bossTexture.id != 0) {
+                Rectangle srcB = {0,0,(float)bossTexture.width,(float)bossTexture.height};
+                Vector2 originB = { bossTexture.width/2.0f, bossTexture.height/2.0f };
+                Rectangle destB = { drawPosB.x, drawPosB.y, bossTexture.width*scaleB, bossTexture.height*scaleB };
+                DrawTexturePro(bossTexture, srcB, destB, originB, 0.0f, bossTint);
+                bossDrawHeight = bossTexture.height * scaleB;
+            } else {
+                DrawBossSprite((int)drawPosB.x - 20, (int)drawPosB.y - 60);
+                bossDrawHeight = 120.0f;
+            }
+        }
+    } else {
+        // Fallback position adjusted to GROUND_Y
+        int fallbackBossH = 120;
+        int fallbackBossY = (int)GROUND_Y - fallbackBossH;
+        DrawBossSprite(SCREEN_WIDTH - 250 - 20, fallbackBossY); 
+        bossDrawHeight = 120.0f;
+    }
+
+    // Boss hurt overlay
+    if (bossHurtTimer > 0.0f && bossHitTexture.id != 0) {
+        float hitW = (float)bossHitTexture.width;
+        float hitH = (float)bossHitTexture.height;
+        Rectangle srcHit = {0,0,hitW,hitH};
+        Vector2 originHit = { hitW/2.0f, hitH/2.0f };
+        Rectangle destHit = { drawPosB.x, drawPosB.y, hitW, hitH };
+        DrawTexturePro(bossHitTexture, srcHit, destHit, originHit, 0.0f, WHITE);
+    }
+
+    // --- Desenhar Jogador (ESQUERDA) ---
+    int baseX = 250; 
+    float playerScale = 1.0f;
+    
+    // Obter altura da textura do Player
+    float playerTexH = 64.0f; 
+    if (texturesInitialized && playerTexture.id != 0) {
+        playerTexH = (float)playerTexture.height;
+    }
+    if (texturesInitialized && playerIsAttacking && playerAttackTexture.id != 0 && playerAttackFrameCount > 0) {
+        playerTexH = (float)playerAttackTexture.height;
+    }
+    
+    // Posição base do Jogador: centro Y é a linha do chão menos metade da altura
+    float playerCenterY = GROUND_Y - (playerTexH * playerScale) / 2.0f; 
+
+    // Attack movement: player moves toward boss (ESQUERDA PARA DIREITA)
+    float attackOffsetX = 0.0f;
+    float attackOffsetY = 0.0f; // Mantém o sprite no chão
+    if (playerIsAttacking) {
+        float progress = 1.0f - (playerAttackTimer / PLAYER_ATTACK_DURATION);
+        if (progress < 0.0f) progress = 0.0f;
+        if (progress > 1.0f) progress = 1.0f;
+        float ease = sinf(progress * 3.14159f);
+        
+        // Ponto de encontro: 450 (ligeramente à esquerda do centro)
+        const float LUNGE_DISTANCE = 450.0f - baseX; 
+        
+        attackOffsetX = LUNGE_DISTANCE * ease; // Avança para a direita (POSITIVO)
+    }
+
+    // Hurt blinking alpha for player
+    float alphaF = 1.0f;
+    if (playerHurtTimer > 0.0f) {
+        alphaF = (sinf(playerHurtTimer * 30.0f) > 0.0f) ? 1.0f : 0.25f;
+    }
+    Color tint = (Color){255, 255, 255, (unsigned char)(255.0f * alphaF)};
+
+    float drawCenterY = playerCenterY + attackOffsetY;
+
+    // Draw player sprite scaled 
+    if (texturesInitialized) {
+        if (playerIsAttacking && playerAttackTexture.id != 0 && playerAttackFrameCount > 0) {
+            int frameW = playerAttackTexture.height;
+            int frameH = playerAttackTexture.height;
+            Rectangle src = { (float)(playerAttackFrame * frameW), 0, (float)frameW, (float)frameH };
+            Vector2 origin = { frameW/2.0f, frameH/2.0f };
+            Rectangle dest = { (float)baseX + attackOffsetX, drawCenterY, frameW * playerScale, frameH * playerScale };
+            DrawTexturePro(playerAttackTexture, src, dest, origin, 0.0f, tint);
+        } else {
+            float scale = playerScale;
+            Rectangle src = {0, 0, (float)playerTexture.width, (float)playerTexture.height};
+            Vector2 origin = { playerTexture.width/2.0f, playerTexture.height/2.0f };
+            Rectangle dest = { (float)baseX + attackOffsetX, drawCenterY, playerTexture.width*scale, playerTexture.height*scale };
+            DrawTexturePro(playerTexture, src, dest, origin, 0.0f, tint);
+        }
+        // player hit overlay
+        if (playerHurtTimer > 0.0f && playerHitTexture.id != 0) {
+            float hitW = (float)playerHitTexture.width;
+            float hitH = (float)playerHitTexture.height;
+            Rectangle srcHit = {0,0,hitW,hitH};
+            Vector2 originHit = { hitW/2.0f, hitH/2.0f };
+            Rectangle destHit = { (float)baseX + attackOffsetX, drawCenterY, hitW, hitH };
+            DrawTexturePro(playerHitTexture, srcHit, destHit, originHit, 0.0f, WHITE);
+        }
+    } else {
+        // fallback: draw primitive sprite with top-left positioned so it sits on the ground
+        int fallbackPlayerH = 60; // Altura aproximada do sprite primitivo
+        int fallbackTop = (int)GROUND_Y - fallbackPlayerH; // Posição Y do topo
+        DrawPlayerSprite(baseX - 10, fallbackTop); 
+        if (playerHurtTimer > 0.0f && playerHitTexture.id != 0) {
+            DrawRectangle(baseX - 15, fallbackTop - 10, 40, 10, RED);
+        }
+    }
+
+
     
     int itemPosX = 20;
     int itemWidth = 180;
@@ -517,7 +1076,6 @@ void DrawBattle(void) {
         Color itemColor = (Color){200, 200, 220, 255};
         Color bgColor = (Color){50, 50, 100, 255};
         
-        // Item selecionado
         if (i == selectedItemIndex) {
             DrawRectangle(itemPosX - 5, SCREEN_HEIGHT - 70, itemWidth + 10, 40, (Color){100, 200, 255, 255});
             DrawRectangleLines(itemPosX - 5, SCREEN_HEIGHT - 70, itemWidth + 10, 40, (Color){150, 255, 200, 255});
@@ -527,19 +1085,16 @@ void DrawBattle(void) {
             DrawRectangleLines(itemPosX - 5, SCREEN_HEIGHT - 70, itemWidth + 10, 40, (Color){80, 80, 120, 255});
         }
         
-        // Item já usado
         if (itemUsed[i]) {
             itemColor = (Color){100, 100, 100, 255};
         }
         
         const char* displayName = GetItemName(inventory[i]);
-        // Nao mostrar a Espada e Armadura nos utilitarios (apenas modificam acao)
         if (inventory[i] == ITEM_SWORD || inventory[i] == ITEM_ARMOR) displayName = "Vazio";
         DrawText(displayName, itemPosX + 5, SCREEN_HEIGHT - 58, 12, itemColor);
         itemPosX += itemWidth + 20;
     }
 
-    // Desenhar botao Atacar com estilo
     int btnW = 130;
     int btnH = 45;
     int btnX = SCREEN_WIDTH - btnW - 20;
@@ -549,11 +1104,8 @@ void DrawBattle(void) {
     DrawText("ATACAR [A]", btnX + 10, btnY + 10, 16, WHITE);
 }
 
-// Desenha a Tela Final
 void DrawEnding(bool playerWon) {
     ClearBackground((Color){20, 20, 40, 255});
-    
-    // Fundo decorativo
     DrawRectangle(SCREEN_WIDTH / 2 - 400, SCREEN_HEIGHT / 2 - 200, 800, 400, (Color){40, 40, 80, 200});
     DrawRectangleLines(SCREEN_WIDTH / 2 - 400, SCREEN_HEIGHT / 2 - 200, 800, 400, (Color){100, 200, 255, 255});
     
@@ -568,11 +1120,8 @@ void DrawEnding(bool playerWon) {
     DrawText("Pressione [ENTER] para jogar novamente.", 200, 500, 20, (Color){150, 200, 255, 255});
 }
 
-// Desenha o final de fuga (moeda)
 void DrawEscapeEnding(void) {
     ClearBackground((Color){20, 20, 40, 255});
-    
-    // Fundo decorativo
     DrawRectangle(SCREEN_WIDTH / 2 - 400, SCREEN_HEIGHT / 2 - 200, 800, 400, (Color){40, 40, 80, 200});
     DrawRectangleLines(SCREEN_WIDTH / 2 - 400, SCREEN_HEIGHT / 2 - 200, 800, 400, (Color){255, 200, 100, 255});
     
@@ -582,21 +1131,82 @@ void DrawEscapeEnding(void) {
     DrawText("Pressione [ENTER] para jogar novamente.", 200, 520, 20, (Color){150, 200, 255, 255});
 }
 
-//------------------------------------------------------------------------------------
-// Loop Principal do Jogo
-//------------------------------------------------------------------------------------
+void DrawTitleScreen(void) {
+    if (titleBackgroundTexture.id != 0) {
+        // Desenha a textura para preencher toda a tela
+        DrawTexturePro(
+            titleBackgroundTexture,
+            (Rectangle){ 0, 0, (float)titleBackgroundTexture.width, (float)titleBackgroundTexture.height },
+            (Rectangle){ 0, 0, SCREEN_WIDTH, SCREEN_HEIGHT },
+            (Vector2){ 0, 0 },
+            0.0f,
+            WHITE
+        );
+    } else {
+        ClearBackground((Color){10, 10, 30, 255}); // Fundo escuro padrão
+    }
+
+    // --- Título Principal ---
+    const char* title = "RushRPG";
+    int titleSize = 80;
+    int titleWidth = MeasureText(title, titleSize);
+    
+    // Desenha uma sombra preta para dar contraste com o fundo
+    DrawText(title, SCREEN_WIDTH / 2 - titleWidth / 2 + 3, 100 + 3, titleSize, BLACK);
+    DrawText(title, SCREEN_WIDTH / 2 - titleWidth / 2, 100, titleSize, (Color){255, 200, 100, 255}); // Amarelo/Dourado
+
+    // --- Mensagem para Começar ---
+    const char* startMsg = "Pressione [ENTER] para comecar";
+    int startMsgSize = 30;
+    int startMsgWidth = MeasureText(startMsg, startMsgSize);
+    
+    // Desenha uma sombra para o texto principal
+    DrawText(startMsg, SCREEN_WIDTH / 2 - startMsgWidth / 2 + 2, SCREEN_HEIGHT - 100 + 2, startMsgSize, BLACK);
+    DrawText(startMsg, SCREEN_WIDTH / 2 - startMsgWidth / 2, SCREEN_HEIGHT - 100, startMsgSize, (Color){200, 255, 200, 255}); // Verde claro para destaque
+
+    // --- Espaço para Nomes dos Alunos (Canto Inferior Direito) ---
+    const char* namesHeader = "Trabalho desenvolvido por:";
+    const char* student1 = "Lucas Del Pozo";
+    const char* student2 = "Lucas Sassi";
+    const char* student3 = "Eduardo Parize";
+    const char* student4 = "Vinicius Ribas Bida";
+    
+    int margin = 20; // Margem das bordas
+    int headerSize = 12;
+    int namesSize = 10;
+    
+    // Calcular a posição X baseada na largura da linha mais longa (header)
+    int maxNameWidth = MeasureText(namesHeader, headerSize);
+    
+    // Posição X: Alinhado à direita
+    int namesX = SCREEN_WIDTH - maxNameWidth - margin;
+    // Posição Y: Alinhado à parte inferior (de baixo para cima)
+    int namesY = SCREEN_HEIGHT - 180;
+    
+    // Fundo semi-transparente para garantir legibilidade contra qualquer imagem de fundo
+    DrawRectangle(namesX - 10, namesY - 10, maxNameWidth + 20, 150, (Color){0, 0, 0, 150});
+
+    // Desenha o cabeçalho
+    DrawText(namesHeader, namesX, namesY, headerSize, (Color){255, 255, 255, 255}); // Branco
+    
+    // Desenha os nomes dos alunos
+    DrawText(student1, namesX, namesY + 30, namesSize, (Color){180, 220, 255, 255});
+    DrawText(student2, namesX, namesY + 50, namesSize, (Color){180, 220, 255, 255});
+    DrawText(student3, namesX, namesY + 70, namesSize, (Color){180, 220, 255, 255});
+    DrawText(student4, namesX, namesY + 90, namesSize, (Color){180, 220, 255, 255});
+}
 int main(void) {
-    // Inicialização
     InitWindow(SCREEN_WIDTH, SCREEN_HEIGHT, "Raylib RPG de Turnos");
     InitGame();
     SetTargetFPS(60);
 
     // Loop principal
     while (!WindowShouldClose()) {
-        // -----------------
-        // Update (Lógica)
-        // -----------------
+
         switch (currentState) {
+            case GAME_STATE_TITLE:
+                UpdateTitleScreen();
+                break;
             case GAME_STATE_EXPLORE:
                 UpdateExplore();
                 break;
@@ -610,12 +1220,12 @@ int main(void) {
                 break;
         }
 
-        // -----------------
-        // Draw (Gráficos)
-        // -----------------
         BeginDrawing();
 
         switch (currentState) {
+            case GAME_STATE_TITLE:
+                DrawTitleScreen();
+                break;
             case GAME_STATE_EXPLORE:
                 DrawExplore();
                 break;
@@ -623,20 +1233,35 @@ int main(void) {
                 DrawBattle();
                 break;
             case GAME_STATE_ENDING_GOOD:
-                DrawEnding(true); // Tela de vitória
+                DrawEnding(true);
                 break;
             case GAME_STATE_ENDING_BAD:
-                DrawEnding(false); // Tela de derrota
+                DrawEnding(false);
                 break;
             case GAME_STATE_ENDING_ESCAPE:
-                DrawEscapeEnding(); // Tela de fuga
+                DrawEscapeEnding();
                 break;
         }
 
-        EndDrawing();
-    }
+            EndDrawing();
+        }
 
-    // Finalização
-    CloseWindow();
-    return 0;
-}
+        // Cleanup textures before exit
+        if (playerAttackTexture.id) UnloadTexture(playerAttackTexture);
+        if (playerTexture.id) UnloadTexture(playerTexture);
+        if (bossTexture.id) UnloadTexture(bossTexture);
+        if (bossFrames) {
+            for (int i = 0; i < bossFrameCount; i++) {
+                if (bossFrames[i].id) UnloadTexture(bossFrames[i]);
+            }
+            free(bossFrames);
+            bossFrames = NULL;
+            bossFrameCount = 0;
+        }
+        if (bossAttackTexture.id) UnloadTexture(bossAttackTexture);
+        if (playerHitTexture.id) UnloadTexture(playerHitTexture);
+        if (bossHitTexture.id) UnloadTexture(bossHitTexture);
+
+        CloseWindow();
+        return 0;
+    }
